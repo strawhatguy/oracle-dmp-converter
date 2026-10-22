@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections import Counter
 from contextlib import contextmanager
 from datetime import date, datetime
 from decimal import Decimal
@@ -353,6 +354,56 @@ def test_export_table_calls_write_batch_for_rows(tmp_path: Path) -> None:
     mock_writer.write_batch.assert_called_once()
     mock_writer.write_empty.assert_not_called()
     assert result.rows == 2
+
+
+def test_export_table_writes_malformed_numbers_as_null(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A malformed stored NUMBER decodes as -1E+126; it becomes null with a warning."""
+    columns = (
+        ColumnMetadata("ID", "NUMBER", 1, data_precision=12, data_scale=0),
+        ColumnMetadata("AMOUNT", "NUMBER", 2, data_precision=17, data_scale=5),
+    )
+    bad = Decimal("-1E+126")
+    mock_cursor = MagicMock()
+    mock_cursor.fetchmany.side_effect = [[(bad, bad), (Decimal(7), Decimal("1.5"))], []]
+
+    @contextmanager
+    def _cursor_ctx():
+        yield mock_cursor
+
+    mock_conn = MagicMock()
+    mock_conn.cursor = _cursor_ctx
+
+    out = tmp_path / "out.parquet"
+    with caplog.at_level("WARNING"):
+        result = export_table(
+            mock_conn,
+            schema_name="DMP_SRC",
+            table_name="T",
+            columns=columns,
+            output_path=out,
+        )
+
+    assert result.rows == 2
+    table = pq.read_table(out)
+    assert table.column("ID").to_pylist() == [None, 7]
+    assert table.column("AMOUNT").to_pylist() == [None, Decimal("1.50000")]
+    assert "DMP_SRC.T.ID: 1 unreadable value(s) written as null" in caplog.text
+    assert "DMP_SRC.T.AMOUNT: 1 unreadable" in caplog.text
+
+
+def test_rows_to_table_writes_undecodable_clob_as_null() -> None:
+    """A corrupt CLOB whose read() can't decode UTF-16 becomes null and is counted."""
+    lob = MagicMock()
+    lob.read.side_effect = UnicodeDecodeError("utf-16-be", b"0", 0, 1, "truncated data")
+    schema = pa.schema([pa.field("BODY", pa.string())])
+    unreadable: Counter[str] = Counter()
+
+    table = _rows_to_table([(lob,), ("ok",)], schema, unreadable)
+
+    assert table.column("BODY").to_pylist() == [None, "ok"]
+    assert unreadable == {"BODY": 1}
 
 
 # ---------------------------------------------------------------------------

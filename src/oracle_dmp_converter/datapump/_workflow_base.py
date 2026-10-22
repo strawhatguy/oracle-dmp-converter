@@ -59,9 +59,14 @@ class DumpWorkflow(ABC):
     ) -> None:
         """Import one logical chunk of *table* data into *stage_schema*."""
 
+    def load_master_table(self, job_name: str) -> None:
+        """Load the dump's master table as ``SYSTEM.<job_name>`` (Data Pump only)."""
+        raise NotImplementedError(f"{self.dump_format.value} dumps have no master table")
+
     def import_chunks_batch(
         self,
         chunks: list[tuple[str, str, str, str, str | None, str | None]],
+        queries: tuple[tuple[str, str, str], ...] = (),
     ) -> None:
         """Import multiple chunks in a single Oracle tool invocation.
 
@@ -69,8 +74,11 @@ class DumpWorkflow(ABC):
         partition_name, subpartition_name)``. The default implementation
         falls back to one :meth:`import_chunk` call per entry; concrete
         workflows override this to combine all specs into a single
-        ``impdp``/``imp`` invocation.
+        ``impdp``/``imp`` invocation.  *queries* are ``(source_schema, table,
+        where_clause)`` row filters, supported only by Data Pump.
         """
+        if queries:
+            raise NotImplementedError(f"{self.dump_format.value} dumps cannot filter rows")
         for (
             source_schema,
             stage_schema,

@@ -151,6 +151,12 @@ class TestImportChunksBatch:
         call_args = wf._convert_runner.run_batch_impdp.call_args[0][0]
         assert len(call_args.remap_schemas) == 1
 
+    def test_logfile_name_has_no_dollar(self, tmp_path: Path) -> None:
+        wf = _make_workflow(tmp_path)
+        wf.import_chunks_batch([("SRC", "STAGE", "MLOG$_ADDRESS", "whole", None, None)])
+        job = wf._convert_runner.run_batch_impdp.call_args[0][0]
+        assert job.logfile == "ORACLE_DMC_CONVERT:impdp-batch-MLOG__ADDRESS.log"
+
 
 class TestMakeModernRunners:
     def test_creates_three_runners(self, tmp_path: Path) -> None:

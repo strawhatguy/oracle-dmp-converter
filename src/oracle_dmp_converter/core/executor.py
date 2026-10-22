@@ -15,6 +15,7 @@ import os
 import time
 from collections.abc import Iterator
 from contextlib import AbstractContextManager, contextmanager, nullcontext
+from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -62,6 +63,7 @@ from oracle_dmp_converter.oracle.conn import (
     drop_schema,
     ensure_schema,
     ensure_tablespace,
+    execute_ignore,
     grant_quota_unlimited,
     oracle_connection,
     table_exists,
@@ -71,6 +73,7 @@ from oracle_dmp_converter.oracle.exporter import export_table
 from oracle_dmp_converter.oracle.identifiers import filesystem_safe_identifier
 from oracle_dmp_converter.oracle.metadata import discover_table_metadata
 from oracle_dmp_converter.persistence.state import ChunkState, StateStore
+from oracle_dmp_converter.planner import MAX_BATCH_BYTES
 from oracle_dmp_converter.runtime.admin import OracleAdminConnection
 from oracle_dmp_converter.runtime.container_oracle import ContainerOracle
 
@@ -78,8 +81,12 @@ LOGGER = logging.getLogger(__name__)
 
 _STAGE_SCHEMA_PREFIX = "DMP_"
 
-# Number of tables combined into a single impdp/imp invocation.
+# Most tables combined into a single impdp/imp invocation; batches also stop
+# at MAX_BATCH_BYTES of dump data when table sizes are known.
 TABLE_IMPORT_BATCH_SIZE = 20
+
+# Job name for the master-table load that reads table sizes during inspect.
+_SIZES_JOB = "DMC_TABLE_SIZES"
 
 # Env var name for the optional phase-timing JSONL output.  When set to a
 # writable path, the helpers below append one record per timed phase so we
@@ -465,6 +472,7 @@ class StagingExecutor:
                 self._require_workflow().import_all_metadata(source_schema, stage_schema)
             self._apply_staging_fixups(source_schema)
 
+        sizes = self._dump_table_sizes()
         tables: list[TableMetadata] = []
         for i, (source_schema, table) in enumerate(schema_tables, start=1):
             stage_schema = self._stage_schema_for(source_schema)
@@ -478,13 +486,15 @@ class StagingExecutor:
             )
             with self._connect() as conn:
                 metadata = discover_table_metadata(conn, stage_schema, table)
+            # The staging copy holds no rows yet, so prefer the dump's own figures.
+            dump_bytes, dump_rows = sizes.get((source_schema, table), (None, None))
             tables.append(
                 TableMetadata(
                     schema=source_schema,
                     name=table,
                     columns=metadata.columns,
-                    estimated_bytes=metadata.estimated_bytes,
-                    row_count=metadata.row_count,
+                    estimated_bytes=dump_bytes or metadata.estimated_bytes,
+                    row_count=dump_rows if dump_rows is not None else metadata.row_count,
                     partitions=metadata.partitions,
                     primary_key=metadata.primary_key,
                     unique_keys=metadata.unique_keys,
@@ -496,6 +506,38 @@ class StagingExecutor:
             tables=tuple(tables),
             dump_format=self._workflow.dump_format,
         )
+
+    def _dump_table_sizes(self) -> dict[tuple[str, str], tuple[int, int]]:
+        """Return ``{(schema, table): (dump_bytes, rows)}`` from the dump's master table.
+
+        Only Data Pump dumps carry a master table.  Sizes only steer batching
+        and slicing, so any failure here is logged and treated as "unknown".
+        """
+        workflow = self._require_workflow()
+        if workflow.dump_format != DumpFormat.DATAPUMP:
+            return {}
+        master = f"SYSTEM.{_SIZES_JOB}"
+        try:
+            with self._connect() as conn:
+                execute_ignore(conn, f"DROP TABLE {master} PURGE", {942})
+            workflow.load_master_table(_SIZES_JOB)
+            with self._connect() as conn:
+                with conn.cursor() as cursor:
+                    cursor.execute(
+                        f"SELECT object_schema, object_name, SUM(dump_length), SUM(completed_rows) "
+                        f"FROM {master} WHERE object_type = 'TABLE_DATA' AND process_order > 0 "
+                        "GROUP BY object_schema, object_name"
+                    )
+                    rows = cursor.fetchall()
+                execute_ignore(conn, f"DROP TABLE {master} PURGE", {942})
+        except (DataPumpError, oracledb.DatabaseError) as exc:
+            LOGGER.warning("Could not read table sizes from the dump: %s", exc)
+            return {}
+        LOGGER.info("Read data sizes for %d tables from the dump", len(rows))
+        return {
+            (schema, table): (int(size or 0), int(count or 0))
+            for schema, table, size, count in rows
+        }
 
     def get_prepared_schemas(self) -> frozenset[str]:
         """Return the staging schemas this executor has prepared so far.
@@ -730,6 +772,8 @@ class StagingExecutor:
         chunk: ChunkPlan,
         output_dir: Path,
     ) -> ChunkConversionResult:
+        if chunk.where:
+            raise ValueError(f"{table_plan.qualified_name} {chunk.name}: slices need convert_plan")
         self.import_table_chunk(
             source_schema=table_plan.schema,
             table=table_plan.table,
@@ -1045,6 +1089,25 @@ class StagingExecutor:
                     ", ".join(f"{s}.{t}" for s, t in remaining),
                 )
 
+    def _release_stage_tables(self, pending: list[tuple[TablePlan, ChunkPlan]]) -> None:
+        """Truncate this batch's staging tables once their chunks are exported.
+
+        Oracle Free caps user data at 12 GB, so exported rows must not pile up
+        across batches.  Every chunk of a table is in the same batch, and slice
+        chunks rely on the table being empty before their import.  A table that
+        can't be truncated (e.g. a reference-partitioned parent, ORA-02266)
+        just keeps its space.
+        """
+        targets = dict.fromkeys((self._stage_schema_for(tp.schema), tp.table) for tp, _ in pending)
+        with self._connect() as conn:
+            for stage_schema, table in targets:
+                try:
+                    truncate_table(conn, stage_schema, table)
+                except oracledb.DatabaseError as exc:
+                    LOGGER.warning(
+                        "Could not free %s.%s after export: %s", stage_schema, table, exc
+                    )
+
     def _mark_pending_failed(
         self,
         pending: list[tuple[TablePlan, ChunkPlan]],
@@ -1151,6 +1214,7 @@ class StagingExecutor:
             )
             for tp, chunk in pending
         ]
+        queries = tuple((tp.schema, tp.table, chunk.where) for tp, chunk in pending if chunk.where)
 
         try:
             with _phase_timer(
@@ -1158,7 +1222,7 @@ class StagingExecutor:
                 dump_format=workflow.dump_format.value,
                 chunks=len(import_specs),
             ):
-                workflow.import_chunks_batch(import_specs)
+                workflow.import_chunks_batch(import_specs, queries)
         except Exception as exc:
             self._mark_pending_failed(pending, state_store, exc)
             raise
@@ -1212,6 +1276,7 @@ class StagingExecutor:
                         exc,
                     )
 
+        self._release_stage_tables(pending)
         return [
             TableConversionResult(
                 source_schema=tp.schema,
@@ -1265,15 +1330,16 @@ class StagingExecutor:
                 self._clear_modern_stage_tables_for_plan(supported, state_store, prefetched)
 
         plan_started_at = datetime.now(UTC)
-        results: list[TableConversionResult] = []
-        for batch_start in range(0, len(supported), TABLE_IMPORT_BATCH_SIZE):
-            batch = supported[batch_start : batch_start + TABLE_IMPORT_BATCH_SIZE]
+        # Slices of one table arrive as separate batches, so gather chunks per table.
+        results: dict[str, TableConversionResult] = {}
+        batches = list(_size_batches(supported))
+        for number, (batch, batch_bytes) in enumerate(batches, start=1):
             LOGGER.info(
-                "Importing batch of %d table(s) (%d–%d of %d)",
+                "Importing batch %d of %d: %d table(s), %.1f GiB",
+                number,
+                len(batches),
                 len(batch),
-                batch_start + 1,
-                batch_start + len(batch),
-                len(supported),
+                batch_bytes / 1024**3,
             )
             batch_results = self.convert_table_batch(batch, output_dir, state_store, prefetched)
             for tp, table_result in zip(batch, batch_results, strict=True):
@@ -1283,10 +1349,49 @@ class StagingExecutor:
                     tp.table,
                     table_result.rows,
                 )
-            results.extend(batch_results)
+                earlier = results.get(tp.qualified_name)
+                results[tp.qualified_name] = (
+                    replace(table_result, chunks=earlier.chunks + table_result.chunks)
+                    if earlier
+                    else table_result
+                )
         plan_completed_at = datetime.now(UTC)
         return PlanConversionResult(
-            tables=tuple(results),
+            tables=tuple(results.values()),
             started_at=plan_started_at,
             completed_at=plan_completed_at,
         )
+
+
+def _size_batches(table_plans: list[TablePlan]) -> Iterator[tuple[list[TablePlan], int]]:
+    """Yield ``(batch, dump_bytes)`` import batches that fit the staging database.
+
+    A batch closes at :data:`TABLE_IMPORT_BATCH_SIZE` tables or
+    :data:`MAX_BATCH_BYTES` of dump data, whichever comes first.  Each slice
+    of a ``SLICE`` table becomes its own unit, and two units of one table never
+    share a batch (one ``impdp`` job takes a single ``QUERY=`` per table).  A
+    unit larger than the budget still goes alone in its own batch.
+    """
+    units: list[tuple[TablePlan, int]] = []
+    for tp in table_plans:
+        size = int(tp.extra.get("estimated_bytes") or 0)
+        if tp.strategy == TableStrategy.SLICE:
+            units.extend(
+                (replace(tp, chunks=(chunk,)), size // len(tp.chunks)) for chunk in tp.chunks
+            )
+        else:
+            units.append((tp, size))
+    batch: list[TablePlan] = []
+    batch_bytes = 0
+    for tp, size in units:
+        if batch and (
+            len(batch) >= TABLE_IMPORT_BATCH_SIZE
+            or batch_bytes + size > MAX_BATCH_BYTES
+            or any(b.qualified_name == tp.qualified_name for b in batch)
+        ):
+            yield batch, batch_bytes
+            batch, batch_bytes = [], 0
+        batch.append(tp)
+        batch_bytes += size
+    if batch:
+        yield batch, batch_bytes
