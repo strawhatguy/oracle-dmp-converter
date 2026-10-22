@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections import Counter
 from contextlib import contextmanager
 from datetime import date, datetime
 from decimal import Decimal
@@ -388,8 +389,21 @@ def test_export_table_writes_malformed_numbers_as_null(
     table = pq.read_table(out)
     assert table.column("ID").to_pylist() == [None, 7]
     assert table.column("AMOUNT").to_pylist() == [None, Decimal("1.50000")]
-    assert "DMP_SRC.T.ID: 1 unreadable NUMBER value(s) written as null" in caplog.text
+    assert "DMP_SRC.T.ID: 1 unreadable value(s) written as null" in caplog.text
     assert "DMP_SRC.T.AMOUNT: 1 unreadable" in caplog.text
+
+
+def test_rows_to_table_writes_undecodable_clob_as_null() -> None:
+    """A corrupt CLOB whose read() can't decode UTF-16 becomes null and is counted."""
+    lob = MagicMock()
+    lob.read.side_effect = UnicodeDecodeError("utf-16-be", b"0", 0, 1, "truncated data")
+    schema = pa.schema([pa.field("BODY", pa.string())])
+    unreadable: Counter[str] = Counter()
+
+    table = _rows_to_table([(lob,), ("ok",)], schema, unreadable)
+
+    assert table.column("BODY").to_pylist() == [None, "ok"]
+    assert unreadable == {"BODY": 1}
 
 
 # ---------------------------------------------------------------------------

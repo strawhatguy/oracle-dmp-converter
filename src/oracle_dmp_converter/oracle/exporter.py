@@ -249,6 +249,22 @@ def _coerce_value(value: Any, arrow_type: pa.DataType) -> Any:
     return value
 
 
+class _UnreadableValueError(Exception):
+    """A stored value is malformed in the dump and can't be converted."""
+
+
+def _coerce_readable(value: Any, arrow_type: pa.DataType) -> Any:
+    """:func:`_coerce_value`, raising :class:`_UnreadableValueError` for malformed values."""
+    if isinstance(value, Decimal) and (not value.is_finite() or abs(value) >= _NUMBER_LIMIT):
+        raise _UnreadableValueError
+    try:
+        return _coerce_value(value, arrow_type)
+    except UnicodeDecodeError as exc:
+        # The same corruption in a CLOB reads back as a stray byte that the
+        # driver can't decode as UTF-16.
+        raise _UnreadableValueError from exc
+
+
 def _rows_to_table(
     rows: list[tuple[Any, ...]],
     schema: pa.Schema,
@@ -264,8 +280,9 @@ def _rows_to_table(
     Args:
         rows: List of row tuples as returned by ``cursor.fetchmany()``.
         schema: Arrow schema describing the expected columns and types.
-        unreadable: Per-column count of malformed NUMBER values, which are
-            written as null instead of failing the whole table.
+        unreadable: Per-column count of malformed values (NUMBERs out of
+            range, CLOBs that can't be decoded), which are written as null
+            instead of failing the whole table.
 
     Returns:
         A :class:`~pyarrow.Table` with *schema* and one row per element in
@@ -275,14 +292,12 @@ def _rows_to_table(
     for index, field in enumerate(schema):
         values = []
         for row in rows:
-            value = row[index]
-            if isinstance(value, Decimal) and (
-                not value.is_finite() or abs(value) >= _NUMBER_LIMIT
-            ):
+            try:
+                values.append(_coerce_readable(row[index], field.type))
+            except _UnreadableValueError:
                 if unreadable is not None:
                     unreadable[field.name] += 1
-                value = None
-            values.append(_coerce_value(value, field.type))
+                values.append(None)
         arrays.append(pa.array(values, type=field.type))
     return pa.Table.from_arrays(arrays, schema=schema)
 
@@ -371,7 +386,7 @@ def export_table(
         writer.close()
     for column, count in unreadable.items():
         LOGGER.warning(
-            "%s.%s.%s: %d unreadable NUMBER value(s) written as null (malformed in the dump)",
+            "%s.%s.%s: %d unreadable value(s) written as null (malformed in the dump)",
             schema_name,
             table_name,
             column,
