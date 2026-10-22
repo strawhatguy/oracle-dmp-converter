@@ -62,6 +62,8 @@ class BatchImportJob:
     # Each entry: (source_schema, table, partition_name_or_None)
     table_specs: tuple[tuple[str, str, str | None], ...]
     remap_schemas: tuple[tuple[str, str], ...] = ()
+    # Each entry: (source_schema, table, where_clause) rendered as one QUERY= line.
+    queries: tuple[tuple[str, str, str], ...] = ()
     content: str | None = None
     # APPEND rather than TRUNCATE: staging tables are guaranteed empty after
     # inspect's metadata-only import, so APPEND is equivalent to TRUNCATE+load
@@ -114,6 +116,10 @@ class BulkMetadataImportJob:
             "FUNCTION",
             "PROCEDURE",
             "MATERIALIZED_VIEW",
+            # MV logs need the PKs excluded above (ORA-12014), and their
+            # SYNC_UP_LOG post-table actions name the un-remapped schema (ORA-01435).
+            "MATERIALIZED_VIEW_LOG",
+            "POST_TABLE_ACTION",
         )
     )
     transform: tuple[str, ...] = field(
@@ -197,8 +203,37 @@ def render_batch_import_parfile(job: BatchImportJob) -> str:
         lines.append(f"CONTENT={job.content}")
     for source, target in job.remap_schemas:
         lines.append(f"REMAP_SCHEMA={oracle_identifier(source)}:{oracle_identifier(target)}")
+    for schema, table, where in job.queries:
+        lines.append(f'QUERY={_table_spec(schema, table)}:"{where}"')
     for object_type in job.exclude:
         lines.append(f"EXCLUDE={object_type}")
+    return "\n".join(lines) + "\n"
+
+
+@dataclass(frozen=True)
+class MasterOnlyJob:
+    """``impdp MASTER_ONLY=YES``: load the dump's master table as ``SYSTEM.<job_name>``.
+
+    The master table records every object in the dump, including each table's
+    data size (``DUMP_LENGTH``) and row count, without importing anything else.
+    """
+
+    connection: OracleCredentials
+    directory: str
+    dumpfiles: tuple[str, ...]
+    logfile: str
+    job_name: str
+
+
+def render_master_only_parfile(job: MasterOnlyJob) -> str:
+    lines = [
+        f"USERID={job.connection.userid}",
+        f"DIRECTORY={job.directory}",
+        f"DUMPFILE={','.join(job.dumpfiles)}",
+        f"LOGFILE={job.logfile}",
+        "MASTER_ONLY=YES",
+        f"JOB_NAME={job.job_name}",
+    ]
     return "\n".join(lines) + "\n"
 
 

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import re
 from pathlib import Path
 
 from oracle_dmp_converter.datapump._workflow_base import DumpWorkflow
@@ -10,6 +11,7 @@ from oracle_dmp_converter.datapump.modern.parfile import (
     BatchImportJob,
     BulkMetadataImportJob,
     ImportJob,
+    MasterOnlyJob,
     SqlFileJob,
 )
 from oracle_dmp_converter.datapump.modern.runner import DataPumpRunner
@@ -23,6 +25,15 @@ from oracle_dmp_converter.oracle.conn import OracleCredentials
 LOGGER = logging.getLogger(__name__)
 
 _SQLFILE_NAME = "discovery-impdp-sqlfile.sql"
+
+
+def _log_name(name: str) -> str:
+    """Make *name* safe as a Data Pump log file name.
+
+    Data Pump expands ``$`` in file names as an environment variable, so table
+    names like ``MLOG$_ADDRESS`` fail with ORA-07225.
+    """
+    return re.sub(r"[^A-Za-z0-9_.-]", "_", name)
 
 
 class DataPumpWorkflow(DumpWorkflow):
@@ -151,6 +162,16 @@ class DataPumpWorkflow(DumpWorkflow):
         )
         self._inspect_runner.run_bulk_metadata_impdp(job)
 
+    def load_master_table(self, job_name: str) -> None:
+        job = MasterOnlyJob(
+            connection=self._credentials,
+            directory=self._directory,
+            dumpfiles=self._dumpfiles,
+            logfile=f"{self._inspect_directory}:impdp-master-only.log",
+            job_name=job_name,
+        )
+        self._inspect_runner.run_master_only(job)
+
     def import_metadata(self, source_schema: str, stage_schema: str, table: str) -> None:
         """Import table DDL only (``CONTENT=METADATA_ONLY``) into the staging schema.
 
@@ -162,7 +183,9 @@ class DataPumpWorkflow(DumpWorkflow):
             connection=self._credentials,
             directory=self._directory,
             dumpfiles=self._dumpfiles,
-            logfile=f"{self._inspect_directory}:metadata-{source_schema}-{table}.log"[:200],
+            logfile=f"{self._inspect_directory}:{_log_name(f'metadata-{source_schema}-{table}.log')}"[
+                :200
+            ],
             source_schema=source_schema,
             table=table,
             remap_schema=(source_schema, stage_schema),
@@ -199,7 +222,7 @@ class DataPumpWorkflow(DumpWorkflow):
             connection=self._credentials,
             directory=self._directory,
             dumpfiles=self._dumpfiles,
-            logfile=f"{self._convert_directory}:impdp-{source_schema}-{table}-{chunk_name}.log"[
+            logfile=f"{self._convert_directory}:{_log_name(f'impdp-{source_schema}-{table}-{chunk_name}.log')}"[
                 :200
             ],
             source_schema=source_schema,
@@ -213,6 +236,7 @@ class DataPumpWorkflow(DumpWorkflow):
     def import_chunks_batch(
         self,
         chunks: list[tuple[str, str, str, str, str | None, str | None]],
+        queries: tuple[tuple[str, str, str], ...] = (),
     ) -> None:
         """Import multiple chunks in a single ``impdp`` invocation.
 
@@ -243,7 +267,7 @@ class DataPumpWorkflow(DumpWorkflow):
         remap_schemas = tuple(seen.items())
         # Build a short logfile name from the first few table names.
         table_names = [t for _s, _st, t, _c, _p, _sub in chunks[:3]]
-        logfile_name = f"impdp-batch-{'-'.join(table_names)}.log"[:120]
+        logfile_name = _log_name(f"impdp-batch-{'-'.join(table_names)}.log"[:120])
         job = BatchImportJob(
             connection=self._credentials,
             directory=self._directory,
@@ -251,6 +275,7 @@ class DataPumpWorkflow(DumpWorkflow):
             logfile=f"{self._convert_directory}:{logfile_name}",
             table_specs=table_specs,
             remap_schemas=remap_schemas,
+            queries=queries,
             content="DATA_ONLY",
         )
         self._convert_runner.run_batch_impdp(job)

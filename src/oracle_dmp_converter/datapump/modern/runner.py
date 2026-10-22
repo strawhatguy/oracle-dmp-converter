@@ -11,11 +11,13 @@ from oracle_dmp_converter.datapump.modern.parfile import (
     BulkMetadataImportJob,
     ExportJob,
     ImportJob,
+    MasterOnlyJob,
     SqlFileJob,
     render_batch_import_parfile,
     render_bulk_metadata_import_parfile,
     render_export_parfile,
     render_import_parfile,
+    render_master_only_parfile,
     render_sqlfile_parfile,
 )
 
@@ -98,6 +100,12 @@ class DataPumpRunner(_BaseRunner):
             render_bulk_metadata_import_parfile(job),
             "impdp-bulk-meta",
             policy=IMPDP_POLICY,
+        )
+
+    def run_master_only(self, job: MasterOnlyJob) -> str:
+        """Run ``impdp MASTER_ONLY=YES`` to load the dump's master table."""
+        return self._run_tool(
+            ["impdp"], render_master_only_parfile(job), "impdp-master", policy=IMPDP_POLICY
         )
 
     def run_sqlfile(self, job: SqlFileJob) -> str:

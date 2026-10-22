@@ -204,6 +204,8 @@ def chunk_plan_to_dict(chunk: ChunkPlan) -> dict[str, Any]:
     # and stable for the common (non-composite) partition case.
     if chunk.subpartition_name is not None:
         payload["subpartition_name"] = chunk.subpartition_name
+    if chunk.where is not None:
+        payload["where"] = chunk.where
     return payload
 
 
@@ -221,6 +223,7 @@ def chunk_plan_from_dict(data: dict[str, Any]) -> ChunkPlan:
         strategy=TableStrategy(str(data["strategy"])),
         partition_name=data.get("partition_name"),
         subpartition_name=data.get("subpartition_name"),
+        where=data.get("where"),
     )
 
 

@@ -364,6 +364,7 @@ class LegacyDumpWorkflow(DumpWorkflow):
     def import_chunks_batch(
         self,
         chunks: list[tuple[str, str, str, str, str | None, str | None]],
+        queries: tuple[tuple[str, str, str], ...] = (),
     ) -> None:
         """Import multiple tables using as few ``imp`` invocations as possible.
 
@@ -374,6 +375,8 @@ class LegacyDumpWorkflow(DumpWorkflow):
         combined into the ``TABLES=`` list (``schema.table:NAME`` style,
         where NAME is a partition or subpartition name).
         """
+        if queries:
+            raise NotImplementedError("legacy imp cannot filter rows")
         if not chunks:
             return
         # Group table specs by (source_schema, stage_schema), preserving order.

@@ -23,12 +23,15 @@ class TableStrategy(StrEnum):
     Attributes:
         WHOLE_TABLE: Export the entire table in a single operation.
         PARTITION: Export each partition as an independent chunk.
+        SLICE: Import and export a non-partitioned table in hash slices
+            (``impdp QUERY=``) so each slice fits the staging database.
         UNSUPPORTED: The requested strategy cannot be fulfilled; the table is
             skipped with an explanatory reason attached to the plan.
     """
 
     WHOLE_TABLE = "whole_table"
     PARTITION = "partition"
+    SLICE = "slice"
     UNSUPPORTED = "unsupported"
 
 
@@ -238,6 +241,9 @@ class ChunkPlan:
     """Oracle subpartition name for subpartition-drill-down chunks; ``None``
     for whole-table and partition-only chunks. When set, the exporter and
     importer filter rows with a bare ``SUBPARTITION (sub_name)`` clause."""
+    where: str | None = None
+    """``WHERE`` clause passed to ``impdp QUERY=`` for ``SLICE`` chunks; ``None``
+    otherwise. The staging table holds only this slice when it is exported."""
 
 
 @dataclass(frozen=True)

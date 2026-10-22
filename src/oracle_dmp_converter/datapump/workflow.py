@@ -122,8 +122,12 @@ class _ProbedModernWorkflow(DumpWorkflow):
             subpartition_name,
         )
 
+    def load_master_table(self, job_name: str) -> None:
+        self._inner.load_master_table(job_name)
+
     def import_chunks_batch(
         self,
         chunks: list[tuple[str, str, str, str, str | None, str | None]],
+        queries: tuple[tuple[str, str, str], ...] = (),
     ) -> None:
-        self._inner.import_chunks_batch(chunks)
+        self._inner.import_chunks_batch(chunks, queries)

@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import logging
+import math
 from collections.abc import Iterable
+from dataclasses import replace
 
 from oracle_dmp_converter.config import ConverterConfig, table_override
 from oracle_dmp_converter.models import (
@@ -14,9 +16,82 @@ from oracle_dmp_converter.models import (
     TablePlan,
     TableStrategy,
 )
+from oracle_dmp_converter.oracle.identifiers import oracle_identifier
 from oracle_dmp_converter.oracle.types import UNSUPPORTED_COLUMN_TYPES
 
 LOGGER = logging.getLogger(__name__)
+
+# Oracle Free caps user data at 12 GB.  Dump bytes load at roughly 1-1.2x in
+# the staging database, so keep each import batch to 9 GiB of dump data and
+# split bigger tables into ~6 GiB hash slices.
+MAX_BATCH_BYTES = 9 * 1024**3
+SLICE_TARGET_BYTES = 6 * 1024**3
+
+# Types ORA_HASH accepts and that render without quoting or conversion.
+_HASHABLE_TYPES = frozenset(
+    {
+        "NUMBER",
+        "FLOAT",
+        "BINARY_FLOAT",
+        "BINARY_DOUBLE",
+        "VARCHAR2",
+        "NVARCHAR2",
+        "CHAR",
+        "NCHAR",
+        "DATE",
+        "RAW",
+    }  # fmt: skip
+)
+
+
+def _slice_column(table: TableMetadata) -> str | None:
+    """Return the column to hash rows into slices on, or ``None`` if none fits.
+
+    ponytail: first hashable column, usually the ID.  Slices are lopsided if
+    that column has few distinct values; pick the column by config if that bites.
+    """
+    for column in sorted(table.columns, key=lambda c: c.ordinal):
+        if column.hidden or column.normalized_type not in _HASHABLE_TYPES:
+            continue
+        # QUERY= wraps the clause in double quotes, so only bare identifiers fit.
+        if oracle_identifier(column.name) == column.name:
+            return column.name
+    return None
+
+
+def _slice_plan(plan: TablePlan, table: TableMetadata) -> TablePlan:
+    """Split an oversized whole-table plan into hash slices, if possible."""
+    size = table.estimated_bytes or 0
+    if size <= MAX_BATCH_BYTES:
+        return plan
+    column = _slice_column(table)
+    if column is None:
+        return replace(
+            plan,
+            warnings=(
+                *plan.warnings,
+                f"{size / 1024**3:.1f} GiB exceeds the staging limit but has no column to slice on",
+            ),
+        )
+    count = math.ceil(size / SLICE_TARGET_BYTES)
+    LOGGER.info(
+        "%s.%s: %.1f GiB, splitting into %d slices on %s",
+        table.schema,
+        table.name,
+        size / 1024**3,
+        count,
+        column,
+    )
+    # NVL keeps rows whose column is NULL (ORA_HASH(NULL) is NULL) in slice 1.
+    chunks = tuple(
+        ChunkPlan(
+            name=f"slice-{k + 1:03d}-of-{count:03d}",
+            strategy=TableStrategy.SLICE,
+            where=f"WHERE NVL(ORA_HASH({column}, {count - 1}), 0) = {k}",
+        )
+        for k in range(count)
+    )
+    return replace(plan, strategy=TableStrategy.SLICE, chunks=chunks)
 
 
 # Oracle reports owner-qualified type names for some built-in types that
@@ -77,9 +152,8 @@ def _table_unsupported_reason(table: TableMetadata) -> str | None:
 def plan_table(
     table: TableMetadata,
     config: ConverterConfig,
-    dump_format: DumpFormat = DumpFormat.DATAPUMP,  # noqa: ARG001 - retained for API symmetry
+    dump_format: DumpFormat = DumpFormat.DATAPUMP,
 ) -> TablePlan:
-    # pylint: disable=unused-argument  # dump_format kept for backwards-compatible callers.
     """Build a :class:`TablePlan` for a single Oracle table.
 
     Strategy selection follows this priority order:
@@ -100,8 +174,8 @@ def plan_table(
         table: Metadata for the table being planned.
         config: Active converter configuration, used to look up any per-table
             override.
-        dump_format: Retained for API symmetry; partition strategy is now
-            independent of dump format.
+        dump_format: Format of the source dump.  Partition strategy is
+            independent of it; only modern dumps slice oversized tables.
 
     Returns:
         A :class:`TablePlan` with an appropriate strategy and chunk list.
@@ -146,12 +220,15 @@ def plan_table(
 
     if not table.partitions:
         LOGGER.debug("%s.%s: strategy=whole (no partitions)", table.schema, table.name)
-        return TablePlan(
+        plan = TablePlan(
             schema=table.schema,
             table=table.name,
             strategy=TableStrategy.WHOLE_TABLE,
             chunks=(ChunkPlan(name="whole", strategy=TableStrategy.WHOLE_TABLE),),
         )
+        if dump_format is DumpFormat.LEGACY:  # legacy imp has no QUERY= to slice with
+            return plan
+        return _slice_plan(plan, table)
 
     LOGGER.debug(
         "%s.%s: strategy=partition (%d partitions)", table.schema, table.name, len(table.partitions)
@@ -208,4 +285,11 @@ def plan_tables(
     Returns:
         Tuple of :class:`TablePlan` instances in the same order as *tables*.
     """
-    return tuple(plan_table(table, config, dump_format) for table in tables)
+    plans: list[TablePlan] = []
+    for table in tables:
+        plan = plan_table(table, config, dump_format)
+        if table.estimated_bytes:
+            # convert_plan packs import batches by this size.
+            plan = replace(plan, extra={**plan.extra, "estimated_bytes": table.estimated_bytes})
+        plans.append(plan)
+    return tuple(plans)
