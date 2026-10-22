@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+from collections import Counter
 from dataclasses import dataclass
 from datetime import date, datetime, time
 from decimal import ROUND_HALF_UP, Decimal, localcontext
@@ -20,6 +21,11 @@ from oracle_dmp_converter.oracle.identifiers import oracle_identifier, oracle_qu
 from oracle_dmp_converter.oracle.types import export_expression, oracle_to_arrow_token
 
 LOGGER = logging.getLogger(__name__)
+
+# Oracle NUMBER holds magnitudes below 1E126.  A malformed stored NUMBER (seen
+# in a 19c dump as a single 0x30 byte, ORA-03090 in Oracle itself) decodes in
+# python-oracledb as -1E+126, so anything at or past the bound is not a value.
+_NUMBER_LIMIT = Decimal("1E126")
 
 
 @dataclass(frozen=True)
@@ -243,7 +249,11 @@ def _coerce_value(value: Any, arrow_type: pa.DataType) -> Any:
     return value
 
 
-def _rows_to_table(rows: list[tuple[Any, ...]], schema: pa.Schema) -> pa.Table:
+def _rows_to_table(
+    rows: list[tuple[Any, ...]],
+    schema: pa.Schema,
+    unreadable: Counter[str] | None = None,
+) -> pa.Table:
     """Convert a list of raw Oracle rows to a :class:`~pyarrow.Table`.
 
     Each column is built as a :class:`~pyarrow.Array` by calling
@@ -254,6 +264,8 @@ def _rows_to_table(rows: list[tuple[Any, ...]], schema: pa.Schema) -> pa.Table:
     Args:
         rows: List of row tuples as returned by ``cursor.fetchmany()``.
         schema: Arrow schema describing the expected columns and types.
+        unreadable: Per-column count of malformed NUMBER values, which are
+            written as null instead of failing the whole table.
 
     Returns:
         A :class:`~pyarrow.Table` with *schema* and one row per element in
@@ -261,7 +273,16 @@ def _rows_to_table(rows: list[tuple[Any, ...]], schema: pa.Schema) -> pa.Table:
     """
     arrays = []
     for index, field in enumerate(schema):
-        values = [_coerce_value(row[index], field.type) for row in rows]
+        values = []
+        for row in rows:
+            value = row[index]
+            if isinstance(value, Decimal) and (
+                not value.is_finite() or abs(value) >= _NUMBER_LIMIT
+            ):
+                if unreadable is not None:
+                    unreadable[field.name] += 1
+                value = None
+            values.append(_coerce_value(value, field.type))
         arrays.append(pa.array(values, type=field.type))
     return pa.Table.from_arrays(arrays, schema=schema)
 
@@ -327,6 +348,7 @@ def export_table(
     total_rows = 0
     writer: FormatWriter = make_writer(output_format, output_path, arrow_schema)
     has_rows = False
+    unreadable: Counter[str] = Counter()
     try:
         with conn.cursor() as cursor:
             cursor.arraysize = batch_size
@@ -339,7 +361,7 @@ def export_table(
                 rows = cursor.fetchmany(batch_size)
                 if not rows:
                     break
-                table = _rows_to_table(rows, arrow_schema)
+                table = _rows_to_table(rows, arrow_schema, unreadable)
                 writer.write_batch(table)
                 has_rows = True
                 total_rows += len(rows)
@@ -347,4 +369,12 @@ def export_table(
             writer.write_empty(arrow_schema)
     finally:
         writer.close()
+    for column, count in unreadable.items():
+        LOGGER.warning(
+            "%s.%s.%s: %d unreadable NUMBER value(s) written as null (malformed in the dump)",
+            schema_name,
+            table_name,
+            column,
+            count,
+        )
     return ExportResult(path=output_path, rows=total_rows)
